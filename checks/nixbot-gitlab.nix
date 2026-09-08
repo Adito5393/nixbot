@@ -124,9 +124,13 @@
           chmod 644 /var/lib/secrets/gitlab-token
 
           # The legacy-import topic enables the project on first discovery.
-          curl -fs -X POST -H "PRIVATE-TOKEN: $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"test-flake","visibility":"public","topics":["build-with-buildbot"]}' \
-            http://gitlab/api/v4/projects > /dev/null
+          # gitaly may not be ready yet even though the web UI answers.
+          timeout 300 bash -c 'until curl -fs -H "PRIVATE-TOKEN: $0" http://gitlab/api/v4/projects/root%2Ftest-flake > /dev/null; do
+            curl -s -X POST -H "PRIVATE-TOKEN: $0" -H "Content-Type: application/json" \
+              -d "{\"name\":\"test-flake\",\"visibility\":\"public\",\"topics\":[\"build-with-buildbot\"]}" \
+              http://gitlab/api/v4/projects | jq -c "{id, message, error}"
+            sleep 5
+          done' "$TOKEN"
 
           mkdir -p /tmp/test-flake
           cd /tmp/test-flake
@@ -188,6 +192,12 @@
         retry(hook_registered, timeout_seconds=300)
 
     with subtest("push delivers the webhook"):
+        # Hooks are delivered by sidekiq, which setup-gitlab restarted and
+        # which needs minutes to boot Rails again on a loaded builder.
+        gitlab.wait_until_succeeds(
+            "journalctl -u gitlab-sidekiq _SYSTEMD_INVOCATION_ID=$(systemctl show -P InvocationID gitlab-sidekiq) | grep -q 'Booted Rails'",
+            timeout=600,
+        )
         gitlab.succeed(
             "cd /tmp/test-flake && "
             "echo '# trigger' >> flake.nix && "
