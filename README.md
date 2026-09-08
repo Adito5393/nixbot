@@ -164,8 +164,8 @@ For private repositories, use the public badge URL shown on the repository page:
 https://<nixbot-host>/badge/<token>.svg
 ```
 
-Both report the default branch unless `?branch=<name>` is added. Embed the public
-badge with:
+Both report the default branch unless `?branch=<name>` is added. Embed the
+public badge with:
 
 ```markdown
 [![nixbot](https://<nixbot-host>/badge/<token>.svg)](https://<nixbot-host>/repos/<forge>/<owner>/<repo>)

@@ -392,9 +392,7 @@ class _PageRoutes:
             repository_badge_markdown=self._badge_markdown(
                 request, project, public=False
             ),
-            public_badge_markdown=self._badge_markdown(
-                request, project, public=True
-            ),
+            public_badge_markdown=self._badge_markdown(request, project, public=True),
         )
 
     def _badge_markdown(
