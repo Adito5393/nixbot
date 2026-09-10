@@ -152,15 +152,8 @@ authors cannot grant themselves builds or effects access.
 
 ## Status badges
 
-Each repository page shows copyable markup for an SVG build-status badge:
-
-```markdown
-[![nixbot](https://<nixbot-host>/badge/<token>.svg)](https://<nixbot-host>/repos/<forge>/<owner>/<repo>)
-```
-
-It reports the default branch unless `?branch=<name>` is added. The token
-is unguessable but not secret: anyone with the URL sees the build status,
-which lets image proxies render badges of private repositories.
+The repository page has a "status badge" panel with copyable README
+markup. Append `?branch=<name>` for a branch other than the default.
 
 ## Binary caches
 
