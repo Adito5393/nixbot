@@ -389,26 +389,16 @@ class _PageRoutes:
                 await store.latest_runs_for_project(project["id"]),
             ),
             can_run_schedules=await self._can_run_schedules(request, project["id"]),
-            repository_badge_markdown=self._badge_markdown(
-                request, project, public=False
-            ),
-            public_badge_markdown=self._badge_markdown(request, project, public=True),
+            badge_markdown=self._badge_markdown(request, project),
         )
 
-    def _badge_markdown(
-        self, request: Request, project: dict[str, Any], *, public: bool
-    ) -> str:
+    def _badge_markdown(self, request: Request, project: dict[str, Any]) -> str:
         base = (self.ctx.base_url or str(request.base_url)).rstrip("/")
         repo_url = (
             f"{base}/repos/{quote(project['forge'], safe='')}"
             f"/{quote(project['owner'], safe='/')}/{quote(project['name'], safe='')}"
         )
-        badge_url = (
-            f"{base}/badge/{project['badge_token']}.svg"
-            if public
-            else f"{repo_url}/badge.svg"
-        )
-        return f"[![nixbot]({badge_url})]({repo_url})"
+        return f"[![nixbot]({base}/badge/{project['badge_token']}.svg)]({repo_url})"
 
     async def _can_run_schedules(self, request: Request, project_id: int) -> bool:
         """UX only. The run-schedule route re-checks server-side."""
@@ -762,9 +752,9 @@ the instance restricts project visibility.
      drv/line/phase/drv-done deltas with raw text, `done` at the end
 - GET /api/events?build=N -> SSE build/attribute status-change cues
 - GET /repos/{forge}/{owner}/{name}/badge.svg?branch=B
-  -> access-controlled SVG build-status badge for a branch
+  -> SVG build-status badge for a branch, subject to repository visibility
 - GET /badge/{token}.svg?branch=B
-  -> public SVG build-status badge for a branch (token shown on the repo page)
+  -> the same without a session (token shown on the repo page)
 
 ## Control (Authorization: Bearer <token>; create tokens at /settings)
 

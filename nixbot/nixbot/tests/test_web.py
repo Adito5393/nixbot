@@ -144,18 +144,12 @@ def test_status_badge_urls(client: WebHarness) -> None:
     )
 
     page = client.get("/repos/github/acme/widget").text
-    repository_markdown = (
-        "[![nixbot](http://test/repos/github/acme/widget/badge.svg)]"
-        "(http://test/repos/github/acme/widget)"
-    )
-    public_markdown = (
+    markdown = (
         f"[![nixbot](http://test/badge/{token}.svg)]"
         "(http://test/repos/github/acme/widget)"
     )
-    assert repository_markdown in page
-    assert public_markdown in page
-    assert 'aria-label="copy repository badge markup"' in page
-    assert 'aria-label="copy public badge markup"' in page
+    assert markdown in page
+    assert 'aria-label="copy badge markup"' in page
 
     public = client.get(f"/badge/{token}.svg")
     assert public.status_code == 200
