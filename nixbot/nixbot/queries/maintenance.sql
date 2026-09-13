@@ -9,8 +9,8 @@ SELECT 1 AS one FROM build_attributes WHERE build_id = $1 AND attr = $2;
 -- One atomic statement for a restart (attr NULL = full restart):
 -- clear cached failures so the attributes actually build again
 -- instead of re-skipping, reset the targeted attribute rows, and
--- requeue the build. A full restart also re-runs effects; a partial
--- rebuild must not re-deploy. The build ends up queued, not started:
+-- requeue the build. Build-owned effect rows of a full restart are
+-- dropped by DropEffectsForRerun before this. The build ends up queued:
 -- the rerun decides whether this becomes a re-eval (evaluating) or
 -- an attribute rerun (building). Clearing finished_at keeps
 -- retention cleanup off a build that is about to rerun; clearing
@@ -30,11 +30,6 @@ WITH cleared_failures AS (
         log_truncated = FALSE
     WHERE build_id = sqlc.arg(build_id)::bigint
       AND (sqlc.narg(attr)::text IS NULL OR attr = sqlc.narg(attr))
-), reset_effect_rows AS (
-    UPDATE effect_runs SET status = 'pending', error = NULL,
-        finished_at = NULL, log_size = 0, log_truncated = FALSE
-    WHERE build_id = sqlc.arg(build_id)::bigint AND owner = 'build'
-      AND sqlc.narg(attr)::text IS NULL
 ), cancel_event_rows AS (
     -- Event effects are re-delivered when the rebuilt build settles.
     -- Finished ones keep their history and log.
@@ -46,24 +41,27 @@ WITH cleared_failures AS (
     WHERE build_id = sqlc.arg(build_id)::bigint AND sqlc.narg(attr)::text IS NULL
 )
 UPDATE builds SET status = 'pending', error = NULL,
-    eval_warnings = NULL, started_at = NULL, finished_at = NULL,
-    effects_started = CASE WHEN sqlc.narg(attr)::text IS NULL
-        THEN FALSE ELSE effects_started END
+    eval_warnings = NULL, started_at = NULL, finished_at = NULL
 WHERE builds.id = sqlc.arg(build_id)::bigint;
 
--- name: ResetEffectsState :exec
--- Drop the started-flag and reset the effect rows atomically (a
--- crash between the two writes must not leave re-runnable effects
--- behind a still-set flag). A NULL names resets every row. Otherwise
--- only the named effects are reset.
+-- name: DropEffectsForRerun :exec
+-- Drop the started-flag, the named onPush rows (NULL = all build-owned
+-- rows) and their queued items in one statement so a crash in between
+-- cannot leave re-runnable effects behind a set flag.
 WITH flag AS (
-    UPDATE builds SET effects_started = FALSE WHERE id = sqlc.arg(build_id)
+    UPDATE builds SET effects_started = FALSE WHERE id = sqlc.arg(build_id)::bigint
+), dropped AS (
+    DELETE FROM effect_runs
+    WHERE build_id = sqlc.arg(build_id)::bigint AND owner = 'build'
+      AND (sqlc.narg(names)::text[] IS NULL
+           OR (kind = 'push' AND name = ANY(sqlc.narg(names)::text[])))
+    RETURNING kind, name
 )
-UPDATE effect_runs SET status = 'pending', error = NULL,
-    finished_at = NULL, log_size = 0,
-    log_truncated = FALSE
-WHERE build_id = sqlc.arg(build_id) AND kind = 'push'
-  AND (sqlc.narg(names)::text[] IS NULL OR name = ANY(sqlc.narg(names)::text[]));
+UPDATE work_queue w SET status = 'done', finished_at = now()
+FROM dropped d
+WHERE w.kind = 'effect' AND w.status = 'pending'
+  AND (w.payload->>'build_id')::bigint = sqlc.arg(build_id)::bigint
+  AND w.payload->>'kind' = d.kind AND w.payload->>'name' = d.name;
 
 -- name: CountUnfinishedAttributes :one
 SELECT count(*) AS count FROM build_attributes

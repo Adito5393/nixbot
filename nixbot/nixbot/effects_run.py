@@ -55,22 +55,26 @@ async def maybe_run_effects(  # noqa: PLR0913
     *,
     only: list[str] | None = None,
 ) -> None:
-    """`only` narrows a rerun to the named effects."""
+    """The only producer of pending build-owned effect rows, each with
+    its queue item. `only` narrows a rerun to the named effects."""
+    fresh = await builds_q.get_build(o.pool, id_=build.id_)
+    if fresh is None:
+        return
+    build = fresh
     allowed = await _effects_allowed(o, event, credentials)
-    # The started-flag guards against auto-re-running effects on crash
-    # recovery (deploys are not idempotent). Record the triggering ref:
-    # effect items carry only build_id and must report on this commit,
-    # not the build's stored commit_sha (a reused PR head).
-    if allowed and (
-        await builds_q.mark_effects_started(
-            o.pool,
-            id_=build.id_,
-            commit_sha=event.commit_sha,
-            branch=event.branch,
-            pr_number=event.pr_number,
-        )
-        is None
-    ):
+    if not allowed and build.effects_commit_sha is not None:
+        # A gated ref does not revoke a recorded allowed one.
+        event = effects_event_for_build(event.repo, build)
+        allowed = await _effects_allowed(o, event, credentials)
+    await builds_q.record_effects_ref(
+        o.pool,
+        id_=build.id_,
+        commit_sha=event.commit_sha,
+        branch=event.branch,
+        pr_number=event.pr_number,
+        allowed=allowed,
+    )
+    if allowed and not await _claim_effects(o, build, only):
         return
     effects = await discover_effects(o, event, build, worktree_path)
     if only is None:
@@ -87,13 +91,53 @@ async def maybe_run_effects(  # noqa: PLR0913
     await q.drop_removed_effects(o.pool, build_id=build.id_, names=list(effects))
     if only is not None:
         effects = {n: m for n, m in effects.items() if n in only}
-    if allowed:
-        await enqueue_effects(o, event, build, effects)
-    elif effects:
-        # Gated refs (PRs) still list what a merge would run.
-        await builds_q.record_skipped_effects(
-            o.pool, build_id=build.id_, names=list(effects)
-        )
+    await _record_effects(o, event, build, effects, allowed=allowed)
+
+
+async def _claim_effects(
+    o: Orchestrator, build: BuildRecord, only: list[str] | None
+) -> bool:
+    """Set the started-flag once per build: deploys are not idempotent,
+    crash recovery must not re-run them."""
+    if build.effects_started:
+        return False
+    if only is None:
+        # Rows a gated pass left (skipped effects, its checks) go.
+        await o.drop_effects(build.id_, None)
+    return await builds_q.mark_effects_started(o.pool, id_=build.id_) is not None
+
+
+async def _record_effects(
+    o: Orchestrator,
+    event: ChangeEvent,
+    build: BuildRecord,
+    effects: dict[str, EffectMeta],
+    *,
+    allowed: bool,
+) -> None:
+    """Pending rows plus queue items, or skipped rows on a gated ref so
+    the page lists what a merge would run."""
+    if not effects:
+        return
+    names = list(effects)
+    await builds_q.insert_build_effects(
+        o.pool,
+        build_id=build.id_,
+        kind="push",
+        status="pending" if allowed else "skipped",
+        names=names,
+        deps=[json.dumps(list(effects[n].after)) for n in names],
+    )
+    if not allowed:
+        return
+    await o.reporter.effects_started(event, build, len(names))
+    await wq.enqueue_effect_items(
+        o.pool,
+        build_id=build.id_,
+        kind="push",
+        names=names,
+        dedup_keys=[_dedup_key(build, n, effects[n]) for n in names],
+    )
 
 
 async def _effects_allowed(
@@ -153,32 +197,6 @@ def _dedup_key(build: BuildRecord, name: str, meta: EffectMeta) -> str:
     return f"build-{build.id_}-effect-{name}"
 
 
-async def enqueue_effects(
-    o: Orchestrator,
-    event: ChangeEvent,
-    build: BuildRecord,
-    effects: dict[str, EffectMeta],
-) -> None:
-    """One queue item per effect."""
-    if not effects:
-        return
-    names = list(effects)
-    await builds_q.start_pending_effects(
-        o.pool,
-        build_id=build.id_,
-        names=names,
-        deps=[json.dumps(list(effects[n].after)) for n in names],
-    )
-    await o.reporter.effects_started(event, build, len(names))
-    await wq.enqueue_effect_items(
-        o.pool,
-        build_id=build.id_,
-        kind="push",
-        names=names,
-        dedup_keys=[_dedup_key(build, n, effects[n]) for n in names],
-    )
-
-
 async def _skip_effect(
     o: Orchestrator, event: ChangeEvent, build: BuildRecord, name: str, failed_dep: str
 ) -> None:
@@ -186,9 +204,17 @@ async def _skip_effect(
     Counts as failed on the forge (a deploy that never ran must not
     look green)."""
     error = f"dependency '{failed_dep}' did not succeed"
-    await builds_q.start_effect(
-        o.pool, build_id=build.id_, kind="push", name=name, status="dependency_failed"
-    )
+    if (
+        await builds_q.claim_effect(
+            o.pool,
+            build_id=build.id_,
+            kind="push",
+            name=name,
+            status="dependency_failed",
+        )
+        is None
+    ):
+        return
     await builds_q.finish_effect(
         o.pool,
         build_id=build.id_,
@@ -239,23 +265,23 @@ async def run_effect_item(  # noqa: PLR0913
     if task is None:
         msg = "run_effect_item must run inside a task"
         raise RuntimeError(msg)
-    if kind == effect_checks.KIND:
-        await effect_checks.run_check_item(o, info, build, name, credentials)
-        await post_effects_summary(o, effects_event_for_build(info, build), build)
-        return
-    if kind != "push":
+    if kind not in ("push", effect_checks.KIND):
         await run_event_effect_item(o, info, build, kind, name, credentials)
         return
     running = RunningEffect(task=task)
-    o.running_effects[(build.id_, name)] = running
+    o.running_effects[(build.id_, kind, name)] = running
     try:
-        await _claimed_effect_item(o, info, build, name, credentials)
+        if kind == effect_checks.KIND:
+            await effect_checks.run_check_item(o, info, build, name, credentials)
+            await post_effects_summary(o, effects_event_for_build(info, build), build)
+        else:
+            await _claimed_effect_item(o, info, build, name, credentials)
     except asyncio.CancelledError:
-        # The restart resets the row and logs after `settled`.
+        # The restart deletes the row and log after `settled`.
         if not running.restart:
             raise
     finally:
-        o.running_effects.pop((build.id_, name), None)
+        o.running_effects.pop((build.id_, kind, name), None)
         running.settled.set()
 
 
@@ -272,17 +298,6 @@ async def _claimed_effect_item(
         # effects never auto-re-run (deploys are not idempotent).
         return
     dep_rows = await builds_q.effect_dep_statuses(o.pool, build_id=build.id_, name=name)
-    unsettled = [d.name for d in dep_rows if d.status in ("pending", "running")]
-    if unsettled:
-        # Only when an effects restart reset the rows under a stale claim;
-        # the restart enqueued fresh items, so defer to those.
-        logger.warning(
-            "effect %s of build %s claimed before %s settled; deferring",
-            name,
-            build.id_,
-            ", ".join(unsettled),
-        )
-        return
     failed_dep = next((d.name for d in dep_rows if d.status != "succeeded"), None)
     if failed_dep is not None:
         event = effects_event_for_build(info, build)
@@ -345,11 +360,10 @@ async def _run_one_effect(
     name: str,
 ) -> None:
     """One effect with its own row and log."""
-    # A rerun resets the existing effect row.
-    run_id = await builds_q.start_effect(
+    run_id = await builds_q.claim_effect(
         o.pool, build_id=build.id_, kind="push", name=name, status="running"
     )
-    if run_id is None:  # build row gone
+    if run_id is None:  # deleted by a restart since the item was claimed
         return
     # A green commit status on a failed deploy hides the failure. Report
     # per-effect status so the forge reflects the real outcome.

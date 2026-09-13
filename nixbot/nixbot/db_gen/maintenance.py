@@ -22,6 +22,7 @@ __all__: collections.abc.Sequence[str] = (
     "commit_eval_result",
     "count_unfinished_attributes",
     "delete_attributes_by_name",
+    "drop_effects_for_rerun",
     "drop_removed_effects",
     "effect_run",
     "effect_status",
@@ -29,7 +30,6 @@ __all__: collections.abc.Sequence[str] = (
     "find_unfinished_builds",
     "project_has_builds",
     "reset_build_for_restart",
-    "reset_effects_state",
     "running_build_ids",
     "succeeded_attribute_outputs",
     "supersede_pending_changes",
@@ -89,48 +89,47 @@ RESET_BUILD_FOR_RESTART: typing.Final[str] = """-- name: ResetBuildForRestart :e
 WITH cleared_failures AS (
     DELETE FROM failed_builds WHERE project_id =
         (SELECT project_id FROM builds
-         WHERE builds.id = $2::bigint)
+         WHERE builds.id = $1::bigint)
     AND derivation IN
         (SELECT drv_path FROM build_attributes
-         WHERE build_id = $2::bigint
-           AND ($1::text IS NULL OR attr = $1))
+         WHERE build_id = $1::bigint
+           AND ($2::text IS NULL OR attr = $2))
 ), reset_attrs AS (
     UPDATE build_attributes SET status = 'pending', error = NULL,
         started_at = NULL, finished_at = NULL, log_size = 0,
         log_truncated = FALSE
-    WHERE build_id = $2::bigint
-      AND ($1::text IS NULL OR attr = $1)
-), reset_effect_rows AS (
-    UPDATE effect_runs SET status = 'pending', error = NULL,
-        finished_at = NULL, log_size = 0, log_truncated = FALSE
-    WHERE build_id = $2::bigint AND owner = 'build'
-      AND $1::text IS NULL
+    WHERE build_id = $1::bigint
+      AND ($2::text IS NULL OR attr = $2)
 ), cancel_event_rows AS (
     -- Event effects are re-delivered when the rebuilt build settles.
     -- Finished ones keep their history and log.
     UPDATE effect_runs SET status = 'cancelled', finished_at = now()
-    WHERE build_id = $2::bigint AND owner = 'delivery'
-      AND status = 'pending' AND $1::text IS NULL
+    WHERE build_id = $1::bigint AND owner = 'delivery'
+      AND status = 'pending' AND $2::text IS NULL
 ), cleared_eval_errors AS (
     DELETE FROM effect_eval_errors
-    WHERE build_id = $2::bigint AND $1::text IS NULL
+    WHERE build_id = $1::bigint AND $2::text IS NULL
 )
 UPDATE builds SET status = 'pending', error = NULL,
-    eval_warnings = NULL, started_at = NULL, finished_at = NULL,
-    effects_started = CASE WHEN $1::text IS NULL
-        THEN FALSE ELSE effects_started END
-WHERE builds.id = $2::bigint
+    eval_warnings = NULL, started_at = NULL, finished_at = NULL
+WHERE builds.id = $1::bigint
 """
 
-RESET_EFFECTS_STATE: typing.Final[str] = """-- name: ResetEffectsState :exec
+DROP_EFFECTS_FOR_RERUN: typing.Final[str] = """-- name: DropEffectsForRerun :exec
 WITH flag AS (
-    UPDATE builds SET effects_started = FALSE WHERE id = $1
+    UPDATE builds SET effects_started = FALSE WHERE id = $1::bigint
+), dropped AS (
+    DELETE FROM effect_runs
+    WHERE build_id = $1::bigint AND owner = 'build'
+      AND ($2::text[] IS NULL
+           OR (kind = 'push' AND name = ANY($2::text[])))
+    RETURNING kind, name
 )
-UPDATE effect_runs SET status = 'pending', error = NULL,
-    finished_at = NULL, log_size = 0,
-    log_truncated = FALSE
-WHERE build_id = $1 AND kind = 'push'
-  AND ($2::text[] IS NULL OR name = ANY($2::text[]))
+UPDATE work_queue w SET status = 'done', finished_at = now()
+FROM dropped d
+WHERE w.kind = 'effect' AND w.status = 'pending'
+  AND (w.payload->>'build_id')::bigint = $1::bigint
+  AND w.payload->>'kind' = d.kind AND w.payload->>'name' = d.name
 """
 
 COUNT_UNFINISHED_ATTRIBUTES: typing.Final[str] = """-- name: CountUnfinishedAttributes :one
@@ -344,12 +343,12 @@ async def attribute_known(conn: ConnectionLike, *, build_id: int, attr: str) -> 
     return row[0]
 
 
-async def reset_build_for_restart(conn: ConnectionLike, *, attr: str | None, build_id: int) -> None:
-    await conn.execute(RESET_BUILD_FOR_RESTART, attr, build_id)
+async def reset_build_for_restart(conn: ConnectionLike, *, build_id: int, attr: str | None) -> None:
+    await conn.execute(RESET_BUILD_FOR_RESTART, build_id, attr)
 
 
-async def reset_effects_state(conn: ConnectionLike, *, build_id: int | None, names: collections.abc.Sequence[str] | None) -> None:
-    await conn.execute(RESET_EFFECTS_STATE, build_id, names)
+async def drop_effects_for_rerun(conn: ConnectionLike, *, build_id: int, names: collections.abc.Sequence[str] | None) -> None:
+    await conn.execute(DROP_EFFECTS_FOR_RERUN, build_id, names)
 
 
 async def count_unfinished_attributes(conn: ConnectionLike, *, build_id: int) -> int | None:

@@ -137,7 +137,9 @@ class Orchestrator:
     attr_cancel_events: dict[tuple[int, str], asyncio.Event] = field(
         default_factory=dict
     )
-    running_effects: dict[tuple[int, str], RunningEffect] = field(default_factory=dict)
+    running_effects: dict[tuple[int, str, str], RunningEffect] = field(
+        default_factory=dict
+    )
     # Event effects by run id, apart from onPush so an effects restart
     # of a build never touches them.
     running_event_effects: dict[int, RunningEffect] = field(default_factory=dict)
@@ -177,6 +179,20 @@ class Orchestrator:
     def _log_dir(self, build_id: int) -> Path:
         return build_log_dir(self.config.state_dir, build_id)
 
+    async def drop_effects(self, build_id: int, names: list[str] | None) -> None:
+        """Cancel the build's effect tasks, then delete their rows, logs
+        and queued items so rediscovery starts clean. `names` narrows
+        this to some onPush effects."""
+        await rerun_exec.cancel_running_effects(self, build_id, names)
+        await self.reset_effect_logs(build_id, names)
+        await q.drop_effects_for_rerun(self.pool, build_id=build_id, names=names)
+
+    async def reset_build_for_restart(self, build_id: int, attr: str | None) -> None:
+        if attr is None:
+            await self.drop_effects(build_id, None)
+        await q.reset_build_for_restart(self.pool, build_id=build_id, attr=attr)
+        await self.reset_build_logs(build_id, attr)
+
     async def reset_build_logs(self, build_id: int, attr: str | None) -> None:
         """Drop the previous run's log files when a build is reset to
         pending. A full restart (attr None) also re-runs effects, so it
@@ -184,7 +200,6 @@ class Orchestrator:
         single-attribute restart removes only that attribute's log."""
         if attr is None:
             shutil.rmtree(self._log_dir(build_id), ignore_errors=True)
-            await self.reset_effect_logs(build_id)
         else:
             attribute_log_path(self.config.state_dir, build_id, attr).unlink(
                 missing_ok=True

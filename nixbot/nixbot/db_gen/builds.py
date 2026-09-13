@@ -17,11 +17,13 @@ __all__: collections.abc.Sequence[str] = (
     "attribute_statuses",
     "backfill_pr_author",
     "bump_build_status",
+    "claim_effect",
     "clear_effect_eval_error",
     "complete_attribute",
     "create_build",
     "create_failed_build",
     "detach_build_from_pr",
+    "drop_removed_checks",
     "effect_dep_statuses",
     "effect_eval_errors",
     "effects_for_build",
@@ -31,19 +33,17 @@ __all__: collections.abc.Sequence[str] = (
     "find_reusable_build",
     "finish_effect",
     "get_build",
+    "insert_build_effects",
     "lock_build_identity",
     "lock_build_row",
     "mark_attribute_building",
     "mark_effects_started",
     "record_attributes",
     "record_effect_eval_error",
-    "record_skipped_effects",
+    "record_effects_ref",
     "set_build_status",
     "set_eval_warnings",
     "settle_unfinished_attributes",
-    "start_effect",
-    "start_pending_checks",
-    "start_pending_effects",
 )
 
 import dataclasses
@@ -182,14 +182,6 @@ UPDATE builds SET eval_warnings = $2::jsonb WHERE id = $1
 """
 
 SET_BUILD_STATUS: typing.Final[str] = """-- name: SetBuildStatus :exec
-WITH failed_effects AS (
-    UPDATE effect_runs SET status = 'failed',
-        error = 'build did not succeed', finished_at = now()
-    WHERE effect_runs.build_id = $4::bigint
-      AND effect_runs.owner = 'build'
-      AND effect_runs.status = 'pending'
-      AND $1::text IN ('failed', 'cancelled')
-)
 UPDATE builds
 SET status = $1,
     -- Every run starts at pending. Drop the previous attempt's
@@ -237,12 +229,18 @@ GET_BUILD: typing.Final[str] = """-- name: GetBuild :one
 SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_duration_ms, actor, merged_pr_number FROM builds WHERE id = $1
 """
 
-MARK_EFFECTS_STARTED: typing.Final[str] = """-- name: MarkEffectsStarted :one
-UPDATE builds SET effects_started = TRUE,
+RECORD_EFFECTS_REF: typing.Final[str] = """-- name: RecordEffectsRef :exec
+UPDATE builds SET
     effects_commit_sha = $1::text,
     effects_branch = $2::text,
     effects_pr_number = $3::bigint
-WHERE id = $4::bigint AND effects_started = FALSE RETURNING id
+WHERE id = $4::bigint
+  AND (effects_commit_sha IS NULL OR $5::boolean)
+"""
+
+MARK_EFFECTS_STARTED: typing.Final[str] = """-- name: MarkEffectsStarted :one
+UPDATE builds SET effects_started = TRUE
+WHERE id = $1::bigint AND effects_started = FALSE RETURNING id
 """
 
 SETTLE_UNFINISHED_ATTRIBUTES: typing.Final[str] = """-- name: SettleUnfinishedAttributes :exec
@@ -298,52 +296,29 @@ WHERE NOT $14::boolean
     OR build_attributes.status IN ('pending', 'building')
 """
 
-START_EFFECT: typing.Final[str] = """-- name: StartEffect :one
-INSERT INTO effect_runs (project_id, kind, build_id, name, status)
-SELECT b.project_id, $1::text, b.id, $2::text,
-       $3::text
-FROM builds b WHERE b.id = $4::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = EXCLUDED.status, error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL
+CLAIM_EFFECT: typing.Final[str] = """-- name: ClaimEffect :one
+UPDATE effect_runs SET status = $1::text, started_at = now()
+WHERE build_id = $2::bigint AND kind = $3::text
+  AND name = $4::text AND status = 'pending'
 RETURNING id
 """
 
-START_PENDING_EFFECTS: typing.Final[str] = """-- name: StartPendingEffects :exec
-INSERT INTO effect_runs (project_id, kind, build_id, name, status, deps)
-SELECT b.project_id, 'push', b.id, u.name, 'pending', u.deps::jsonb
+INSERT_BUILD_EFFECTS: typing.Final[str] = """-- name: InsertBuildEffects :exec
+INSERT INTO effect_runs (project_id, kind, build_id, name, status, deps, finished_at)
+SELECT b.project_id, $1::text, b.id, u.name, $2::text,
+       u.deps::jsonb,
+       CASE WHEN $2::text = 'pending' THEN NULL ELSE now() END
 FROM builds b,
-     (SELECT unnest($1::text[]) AS name,
-             unnest($2::text[]) AS deps) AS u
-WHERE b.id = $3::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = 'pending', error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL,
-    deps = EXCLUDED.deps
-"""
-
-START_PENDING_CHECKS: typing.Final[str] = """-- name: StartPendingChecks :exec
-WITH dropped AS (
-    DELETE FROM effect_runs
-    WHERE build_id = $2::bigint AND kind = 'check'
-      AND status <> 'running' AND NOT (name = ANY($1::text[]))
-)
-INSERT INTO effect_runs (project_id, kind, build_id, name, status)
-SELECT b.project_id, 'check', b.id, u.name, 'pending'
-FROM builds b, unnest($1::text[]) AS u(name)
-WHERE b.id = $2::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = 'pending', error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL
-WHERE effect_runs.status <> 'running'
-"""
-
-RECORD_SKIPPED_EFFECTS: typing.Final[str] = """-- name: RecordSkippedEffects :exec
-INSERT INTO effect_runs (project_id, kind, build_id, name, status, finished_at)
-SELECT b.project_id, 'push', b.id, u.name, 'skipped', now()
-FROM builds b, unnest($1::text[]) AS u(name)
-WHERE b.id = $2::bigint
+     (SELECT unnest($3::text[]) AS name,
+             unnest($4::text[]) AS deps) AS u
+WHERE b.id = $5::bigint
 ON CONFLICT (build_id, kind, name) DO NOTHING
+"""
+
+DROP_REMOVED_CHECKS: typing.Final[str] = """-- name: DropRemovedChecks :exec
+DELETE FROM effect_runs
+WHERE build_id = $1::bigint AND kind = 'check'
+  AND NOT (name = ANY($2::text[]))
 """
 
 EFFECT_DEP_STATUSES: typing.Final[str] = """-- name: EffectDepStatuses :many
@@ -726,8 +701,12 @@ async def get_build(conn: ConnectionLike, *, id_: int) -> models.Build | None:
     )
 
 
-async def mark_effects_started(conn: ConnectionLike, *, commit_sha: str, branch: str, pr_number: int | None, id_: int) -> int | None:
-    row = await conn.fetchrow(MARK_EFFECTS_STARTED, commit_sha, branch, pr_number, id_)
+async def record_effects_ref(conn: ConnectionLike, *, commit_sha: str, branch: str, pr_number: int | None, id_: int, allowed: bool) -> None:
+    await conn.execute(RECORD_EFFECTS_REF, commit_sha, branch, pr_number, id_, allowed)
+
+
+async def mark_effects_started(conn: ConnectionLike, *, id_: int) -> int | None:
+    row = await conn.fetchrow(MARK_EFFECTS_STARTED, id_)
     if row is None:
         return None
     return row[0]
@@ -765,23 +744,19 @@ async def complete_attribute(
     await conn.execute(COMPLETE_ATTRIBUTE, build_id, attr, system, drv_path, status, error, cached, outputs, log_size, log_truncated, eval_warnings, eval_wall_ms, eval_alloc_bytes, if_unfinished)
 
 
-async def start_effect(conn: ConnectionLike, *, kind: str, name: str, status: str, build_id: int) -> int | None:
-    row = await conn.fetchrow(START_EFFECT, kind, name, status, build_id)
+async def claim_effect(conn: ConnectionLike, *, status: str, build_id: int, kind: str, name: str) -> int | None:
+    row = await conn.fetchrow(CLAIM_EFFECT, status, build_id, kind, name)
     if row is None:
         return None
     return row[0]
 
 
-async def start_pending_effects(conn: ConnectionLike, *, names: collections.abc.Sequence[str], deps: collections.abc.Sequence[str], build_id: int) -> None:
-    await conn.execute(START_PENDING_EFFECTS, names, deps, build_id)
+async def insert_build_effects(conn: ConnectionLike, *, kind: str, status: str, names: collections.abc.Sequence[str], deps: collections.abc.Sequence[str], build_id: int) -> None:
+    await conn.execute(INSERT_BUILD_EFFECTS, kind, status, names, deps, build_id)
 
 
-async def start_pending_checks(conn: ConnectionLike, *, names: collections.abc.Sequence[str], build_id: int) -> None:
-    await conn.execute(START_PENDING_CHECKS, names, build_id)
-
-
-async def record_skipped_effects(conn: ConnectionLike, *, names: collections.abc.Sequence[str], build_id: int) -> None:
-    await conn.execute(RECORD_SKIPPED_EFFECTS, names, build_id)
+async def drop_removed_checks(conn: ConnectionLike, *, build_id: int, names: collections.abc.Sequence[str]) -> None:
+    await conn.execute(DROP_REMOVED_CHECKS, build_id, names)
 
 
 def effect_dep_statuses(conn: ConnectionLike, *, build_id: int | None, name: str) -> QueryResults[EffectDepStatusesRow]:

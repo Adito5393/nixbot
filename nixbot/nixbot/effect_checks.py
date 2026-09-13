@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 from nixbot_effects import EffectError
 
 from .db_gen import builds as builds_q
-from .db_gen import maintenance as q
 from .db_gen import work_queue as wq
 from .effects import EffectsContext, effects_context
 from .executor import failure_excerpt
@@ -106,9 +105,17 @@ async def discover_checks(
 async def enqueue_checks(
     o: Orchestrator, event: ChangeEvent, build: BuildRecord, names: list[str]
 ) -> None:
-    await builds_q.start_pending_checks(o.pool, build_id=build.id_, names=names)
+    await builds_q.drop_removed_checks(o.pool, build_id=build.id_, names=names)
     if not names:
         return
+    await builds_q.insert_build_effects(
+        o.pool,
+        build_id=build.id_,
+        kind=KIND,
+        status="pending",
+        names=names,
+        deps=["null"] * len(names),
+    )
     await o.reporter.effects_started(event, build, len(names))
     await wq.enqueue_effect_items(
         o.pool,
@@ -138,10 +145,7 @@ async def run_check_item(
     name: str,
     credentials: FetchCredentials | None,
 ) -> None:
-    row = await q.effect_run(o.pool, build_id=build.id_, kind=KIND, name=name)
-    if row is None or row.status != "pending":
-        return
-    run_id = await builds_q.start_effect(
+    run_id = await builds_q.claim_effect(
         o.pool, build_id=build.id_, kind=KIND, name=name, status="running"
     )
     if run_id is None:

@@ -635,19 +635,9 @@ async def test_effects_started_flag(pool: asyncpg.Pool, tmp_path: Path) -> None:
     build, _ = await db.get_or_create_build(
         pool, project.id, "tree-flag", "sha", "main"
     )
-    assert (
-        await builds_q.mark_effects_started(
-            pool, id_=build.id_, commit_sha="sha", branch="main", pr_number=None
-        )
-        is not None
-    )
+    assert await builds_q.mark_effects_started(pool, id_=build.id_) is not None
     # Second attempt (e.g. crash recovery) must not re-run.
-    assert (
-        await builds_q.mark_effects_started(
-            pool, id_=build.id_, commit_sha="sha", branch="main", pr_number=None
-        )
-        is None
-    )
+    assert await builds_q.mark_effects_started(pool, id_=build.id_) is None
 
 
 async def test_aggregation_generation_monotonic(
@@ -1289,7 +1279,7 @@ async def test_rerun_effects_cancels_hung_effect(
         orchestrator.run_effect_item(project, build, item.payload["name"])
     )
     await asyncio.sleep(0)
-    assert (build.id_, "deploy") in orchestrator.running_effects
+    assert (build.id_, "push", "deploy") in orchestrator.running_effects
 
     fresh = FakeEffects(push={"deploy": EffectMeta()})
     orchestrator.effects = fresh
@@ -1482,14 +1472,28 @@ async def test_eval_failure_settles_streamed_attributes(
 
 
 async def test_effect_rows_roundtrip(pool: asyncpg.Pool, tmp_path: Path) -> None:
-    """Start, finish and rerun-reset of effect rows."""
+    """Insert, claim and finish of effect rows. Only a pending row can
+    be claimed."""
 
     project = await make_project(pool, name="fx")
     build, _ = await db.get_or_create_build(pool, project.id, "tree-fx", "sha", "main")
 
-    await builds_q.start_effect(
-        pool, build_id=build.id_, kind="push", name="deploy", status="running"
+    async def claim() -> int | None:
+        return await builds_q.claim_effect(
+            pool, build_id=build.id_, kind="push", name="deploy", status="running"
+        )
+
+    assert await claim() is None
+    await builds_q.insert_build_effects(
+        pool,
+        build_id=build.id_,
+        kind="push",
+        status="pending",
+        names=["deploy"],
+        deps=["[]"],
     )
+    assert await claim() is not None
+    assert await claim() is None
     await builds_q.finish_effect(
         pool,
         build_id=build.id_,
@@ -1505,15 +1509,7 @@ async def test_effect_rows_roundtrip(pool: asyncpg.Pool, tmp_path: Path) -> None
         ("deploy", "failed", "ssh: connection refused")
     ]
     assert effects[0].finished_at is not None
-
-    # A rerun resets the row to running with fresh timestamps.
-    await builds_q.start_effect(
-        pool, build_id=build.id_, kind="push", name="deploy", status="running"
-    )
-    effects = await builds_q.effects_for_build(pool, build_id=build.id_)
-    assert effects[0].status == "running"
-    assert effects[0].finished_at is None
-    assert effects[0].error is None
+    assert await claim() is None
 
 
 async def test_effect_items_resume_only_pending(
@@ -2057,6 +2053,177 @@ async def test_reuse_for_default_branch_push_runs_effects(
     sha_events = ("effect-started", "effects-started", "effects-finished")
     effect_shas = {e[-1] for e in reporter.events if e[0] in sha_events}
     assert effect_shas == {main_sha}
+
+
+async def test_restart_of_gated_build_settles_effect_rows(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restarting a PR build must not leave its onPush rows pending."""
+    patch_effects(monkeypatch)
+    add_commit(upstream, "gated-restart")
+    sha = git(upstream, "rev-parse", "HEAD")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="gated-restart"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=5)
+    )
+    assert build is not None
+    await drain_effect_items(orchestrator, project, pool)
+    assert await effect_statuses(pool, build.id_) == {"deploy": "skipped"}
+
+    await orchestrator.reset_build_for_restart(build.id_, None)
+    build = await builds_q.get_build(pool, id_=build.id_)
+    assert build is not None
+    await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+    await drain_effect_items(orchestrator, project, pool)
+    assert await effect_statuses(pool, build.id_) == {"deploy": "skipped"}
+    summary = await builds_q.effects_summary(pool, build_id=build.id_)
+    assert summary is not None
+    assert summary.status not in ("pending", "running")
+
+
+async def test_restart_build_drops_queued_effect_items(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deploy queued by the previous run must not fire against the
+    reset build."""
+    ran = patch_effects(monkeypatch).ran
+    add_commit(upstream, "restart-drain")
+    sha = git(upstream, "rev-parse", "HEAD")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="restart-drain"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert build is not None
+    assert await effect_statuses(pool, build.id_) == {"deploy": "pending"}
+
+    await orchestrator.reset_build_for_restart(build.id_, None)
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == []
+    assert await effect_statuses(pool, build.id_) == {}
+
+
+async def test_restart_effects_after_pr_attach_keeps_effects_ref(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A main build later attached to a PR with the same tree still
+    reruns its effects for main."""
+    ran = patch_effects(monkeypatch).ran
+    add_commit(upstream, "attach-restart")
+    sha = git(upstream, "rev-parse", "HEAD")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="attach-restart"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert build is not None
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy"]
+    await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=9)
+    )
+    build = await builds_q.get_build(pool, id_=build.id_)
+    assert build is not None
+    assert build.pr_number == 9
+
+    await orchestrator.rerun_effects(project, build)
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy", "deploy"]
+    assert await effect_statuses(pool, build.id_) == {"deploy": "succeeded"}
+
+    # Same for a full build restart.
+    await orchestrator.reset_build_for_restart(build.id_, None)
+    build = await builds_q.get_build(pool, id_=build.id_)
+    assert build is not None
+    await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy", "deploy", "deploy"]
+
+
+async def test_gated_restart_then_allowed_reuse_deploys(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR build that recorded a gated ref still deploys when main
+    reuses it."""
+    ran = patch_effects(monkeypatch).ran
+    add_commit(upstream, "gated-then-main")
+    sha = git(upstream, "rev-parse", "HEAD")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="gated-then-main"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=5)
+    )
+    assert build is not None
+    await orchestrator.rerun_effects(project, build)
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == []
+    assert await effect_statuses(pool, build.id_) == {"deploy": "skipped"}
+
+    git(upstream, "commit", "--allow-empty", "-m", "merge")
+    await orchestrator.handle_change_event(
+        ChangeEvent(
+            repo=project, branch="main", commit_sha=git(upstream, "rev-parse", "HEAD")
+        )
+    )
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy"]
+    assert await effect_statuses(pool, build.id_) == {"deploy": "succeeded"}
+
+
+async def test_rerun_single_effect_takes_pending_dependents(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restarting A while B (after A) is still queued must not strand B."""
+    patch_effects(
+        monkeypatch,
+        effects={"a": EffectMeta(), "b": EffectMeta(after=("a",))},
+    )
+    add_commit(upstream, "dep-restart")
+    sha = git(upstream, "rev-parse", "HEAD")
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("x")]), FakeExecutor(), name="dep-restart"
+    )
+    build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert build is not None
+    # Run only A's item, leave B queued.
+    queue = WorkQueue(pool)
+    item = await queue.claim_next()
+    assert item is not None
+    assert item.payload["name"] == "a"
+    await orchestrator.run_effect_item(project, build, "a")
+    await queue.finish(item.id)
+    assert await effect_statuses(pool, build.id_) == {"a": "succeeded", "b": "pending"}
+
+    build = await builds_q.get_build(pool, id_=build.id_)
+    assert build is not None
+    await orchestrator.rerun_effects(project, build, only="a")
+    await drain_effect_items(orchestrator, project, pool)
+    assert await effect_statuses(pool, build.id_) == {
+        "a": "succeeded",
+        "b": "succeeded",
+    }
 
 
 async def test_reuse_replays_effect_statuses_to_new_commit(
