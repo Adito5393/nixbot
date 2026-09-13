@@ -131,9 +131,8 @@ async def rerun_pending_attributes(
 async def _rerun_names(
     o: Orchestrator, build: BuildRecord, only: str
 ) -> list[str] | None:
-    """The effect plus its transitive dependency_failed dependents. They
-    must not stay failed after a green rerun. Returns None when
-    `only` is not a row of this build."""
+    """The effect plus transitive dependents that cannot settle on their
+    own. Returns None when `only` is not a row of this build."""
     rows = await builds_q.effects_for_build(o.pool, build_id=build.id_)
     if all(r.name != only for r in rows):
         return None
@@ -143,21 +142,25 @@ async def _rerun_names(
         changed = False
         for r in rows:
             deps = set(json.loads(r.deps)) if r.deps else set()
-            if r.status == "dependency_failed" and r.name not in names and deps & names:
+            # A still-pending dependent would be stranded behind the
+            # rerun row it waits on.
+            stranded = r.status in ("dependency_failed", "pending")
+            if stranded and r.name not in names and deps & names:
                 names.add(r.name)
                 changed = True
     return sorted(names)
 
 
-async def _cancel_running_effects(
+async def cancel_running_effects(
     o: Orchestrator, build_id: int, names: list[str] | None
 ) -> None:
-    """A hung effect run would hold its work-queue dedup key forever,
-    starving the re-enqueued item (issue #139)."""
+    """Cancel the build's push and check tasks (`names`: only these push
+    effects) and wait until they let go of their rows. A hung run would
+    otherwise hold its dedup key forever (issue #139)."""
     running = [
         r
-        for (bid, name), r in o.running_effects.items()
-        if bid == build_id and (names is None or name in names)
+        for (bid, kind, name), r in o.running_effects.items()
+        if bid == build_id and (names is None or (kind == "push" and name in names))
     ]
     for r in running:
         r.cancel()
@@ -188,13 +191,8 @@ async def rerun_effects(
                     extra={"build_id": build.id_, "effect": only},
                 )
                 return
-        await _cancel_running_effects(o, build.id_, names)
-        # Reset under the claim: resetting earlier (e.g. in the
-        # service) could clobber a rerun already in flight. Drop the
-        # previous run's logs here too, so pending rows show no stale
-        # output.
-        await q.reset_effects_state(o.pool, build_id=build.id_, names=names)
-        await o.reset_effect_logs(build.id_, names)
+        # Under the claim: an earlier reset could clobber a rerun in flight.
+        await o.drop_effects(build.id_, names)
         async with rerun_worktree(o, info, build, "effects", credentials) as (
             event,
             worktree_path,

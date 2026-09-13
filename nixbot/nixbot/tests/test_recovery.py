@@ -249,24 +249,6 @@ async def test_check_store_paths_reads_the_nix_db(tmp_path: Path) -> None:
     assert missing == set()
 
 
-async def test_failed_rebuild_settles_pending_effects(pool: asyncpg.Pool) -> None:
-    """A failed rebuild must settle its pending effect rows."""
-
-    build_id = await make_build(pool, "fx-failed-rebuild")
-    await pool.execute(
-        "INSERT INTO effect_runs (project_id, kind, build_id, name, status) "
-        "VALUES ((SELECT project_id FROM builds WHERE id = $1), 'push', $1, 'deploy', 'pending')",
-        build_id,
-    )
-    await db.set_build_status(pool, build_id, "failed")
-    row = await pool.fetchrow(
-        "SELECT status, error FROM effect_runs WHERE build_id = $1",
-        build_id,
-    )
-    assert row["status"] == "failed"
-    assert "did not succeed" in row["error"]
-
-
 async def test_rerun_clears_stale_eval_warnings(pool: asyncpg.Pool) -> None:
     """A re-run build must not show the previous attempt's warnings."""
 

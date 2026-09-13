@@ -91,7 +91,7 @@ async def run_event_effect_item(  # noqa: PLR0913
     row = await q.effect_run(o.pool, build_id=build.id_, kind=kind, name=name)
     if row is None or row.status != "pending" or row.code_rev is None:
         return
-    run_id = await builds_q.start_effect(
+    run_id = await builds_q.claim_effect(
         o.pool, build_id=build.id_, kind=kind, name=name, status="running"
     )
     if run_id is None:

@@ -60,8 +60,7 @@ async def rerun(
         return
     info = repo_info(project)
     if restart:
-        await q.reset_build_for_restart(o.pool, build_id=build_id, attr=attr)
-        await o.reset_build_logs(build_id, attr)
+        await o.reset_build_for_restart(build_id, attr)
         build = await builds_q.get_build(o.pool, id_=build_id)
         if build is None:
             return

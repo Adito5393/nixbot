@@ -85,18 +85,6 @@ WHERE build_attributes.status IN ('pending', 'building');
 UPDATE builds SET eval_warnings = sqlc.arg(warnings)::jsonb WHERE id = $1;
 
 -- name: SetBuildStatus :exec
--- A failed/cancelled build also settles its pending onPush rows in
--- the same statement: they only get queue items when the build
--- succeeds; after a failed rebuild nothing else owns them. Event rows
--- have their own queue items regardless of the build outcome.
-WITH failed_effects AS (
-    UPDATE effect_runs SET status = 'failed',
-        error = 'build did not succeed', finished_at = now()
-    WHERE effect_runs.build_id = sqlc.arg(id)::bigint
-      AND effect_runs.owner = 'build'
-      AND effect_runs.status = 'pending'
-      AND sqlc.arg(status)::text IN ('failed', 'cancelled')
-)
 UPDATE builds
 SET status = sqlc.arg(status),
     -- Every run starts at pending. Drop the previous attempt's
@@ -140,14 +128,19 @@ WHERE build_id = $1;
 -- name: GetBuild :one
 SELECT * FROM builds WHERE id = $1;
 
--- name: MarkEffectsStarted :one
--- Records the triggering ref alongside the flag so the effect items
--- (which only carry build_id) report on the commit that ran them
--- rather than the build's stored commit_sha.
-UPDATE builds SET effects_started = TRUE,
+-- name: RecordEffectsRef :exec
+-- The ref maybe_run_effects last decided for. Effect items (which only
+-- carry build_id) report on it, and restarts gate on it instead of the
+-- build's own ref. An allowed ref replaces a gated one, not vice versa.
+UPDATE builds SET
     effects_commit_sha = sqlc.arg(commit_sha)::text,
     effects_branch = sqlc.arg(branch)::text,
     effects_pr_number = sqlc.narg(pr_number)::bigint
+WHERE id = sqlc.arg(id)::bigint
+  AND (effects_commit_sha IS NULL OR sqlc.arg(allowed)::boolean);
+
+-- name: MarkEffectsStarted :one
+UPDATE builds SET effects_started = TRUE
 WHERE id = sqlc.arg(id)::bigint AND effects_started = FALSE RETURNING id;
 
 -- name: SettleUnfinishedAttributes :exec
@@ -203,54 +196,32 @@ ON CONFLICT (build_id, attr) DO UPDATE SET
 WHERE NOT sqlc.arg(if_unfinished)::boolean
     OR build_attributes.status IN ('pending', 'building');
 
--- name: StartEffect :one
-INSERT INTO effect_runs (project_id, kind, build_id, name, status)
-SELECT b.project_id, sqlc.arg(kind)::text, b.id, sqlc.arg(name)::text,
-       sqlc.arg(status)::text
-FROM builds b WHERE b.id = sqlc.arg(build_id)::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = EXCLUDED.status, error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL
+-- name: ClaimEffect :one
+-- A queue item takes its pending row. No row when a restart deleted it
+-- or another item got there first.
+UPDATE effect_runs SET status = sqlc.arg(status)::text, started_at = now()
+WHERE build_id = sqlc.arg(build_id)::bigint AND kind = sqlc.arg(kind)::text
+  AND name = sqlc.arg(name)::text AND status = 'pending'
 RETURNING id;
 
--- name: StartPendingEffects :exec
--- Batch variant for enqueueing one build's discovered effects.
--- deps carries each effect's `after` list as a JSON array.
-INSERT INTO effect_runs (project_id, kind, build_id, name, status, deps)
-SELECT b.project_id, 'push', b.id, u.name, 'pending', u.deps::jsonb
+-- name: InsertBuildEffects :exec
+-- The only producer of pending build-owned rows. Restarts delete rows
+-- first, so a conflict means the row belongs to a live or finished run
+-- (a gated ref reusing a build) and stays.
+INSERT INTO effect_runs (project_id, kind, build_id, name, status, deps, finished_at)
+SELECT b.project_id, sqlc.arg(kind)::text, b.id, u.name, sqlc.arg(status)::text,
+       u.deps::jsonb,
+       CASE WHEN sqlc.arg(status)::text = 'pending' THEN NULL ELSE now() END
 FROM builds b,
      (SELECT unnest(sqlc.arg(names)::text[]) AS name,
              unnest(sqlc.arg(deps)::text[]) AS deps) AS u
 WHERE b.id = sqlc.arg(build_id)::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = 'pending', error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL,
-    deps = EXCLUDED.deps;
-
--- name: StartPendingChecks :exec
--- Build-time effect checks (kind 'check'): dependencies of every
--- onEvent effect, and of onPush effects on refs where they do not run.
-WITH dropped AS (
-    DELETE FROM effect_runs
-    WHERE build_id = sqlc.arg(build_id)::bigint AND kind = 'check'
-      AND status <> 'running' AND NOT (name = ANY(sqlc.arg(names)::text[]))
-)
-INSERT INTO effect_runs (project_id, kind, build_id, name, status)
-SELECT b.project_id, 'check', b.id, u.name, 'pending'
-FROM builds b, unnest(sqlc.arg(names)::text[]) AS u(name)
-WHERE b.id = sqlc.arg(build_id)::bigint
-ON CONFLICT (build_id, kind, name) DO UPDATE SET
-    status = 'pending', error = NULL, log_size = 0,
-    log_truncated = FALSE, started_at = now(), finished_at = NULL
-WHERE effect_runs.status <> 'running';
-
--- name: RecordSkippedEffects :exec
--- DO NOTHING: rows from a real run (build reused by a gated ref) stay.
-INSERT INTO effect_runs (project_id, kind, build_id, name, status, finished_at)
-SELECT b.project_id, 'push', b.id, u.name, 'skipped', now()
-FROM builds b, unnest(sqlc.arg(names)::text[]) AS u(name)
-WHERE b.id = sqlc.arg(build_id)::bigint
 ON CONFLICT (build_id, kind, name) DO NOTHING;
+
+-- name: DropRemovedChecks :exec
+DELETE FROM effect_runs
+WHERE build_id = sqlc.arg(build_id)::bigint AND kind = 'check'
+  AND NOT (name = ANY(sqlc.arg(names)::text[]));
 
 -- name: EffectDepStatuses :many
 -- Statuses of the effects this effect declared in `after` (onPush only).
